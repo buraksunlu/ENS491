@@ -3,7 +3,6 @@ import json
 import re
 import string
 from datetime import datetime
-from io import BytesIO
 
 from olefile import OleFileIO
 from oletools.olevba import VBA_Parser, VBA_Scanner
@@ -11,8 +10,7 @@ from oletools import rtfobj
 
 
 # ================== CONFIG ==================
-# CHANGE THIS TO YOUR OWN DATASET PATH
-DATASET_ROOT = "/home/burak/Desktop/dataset_root"  # EXAMPLE
+DATASET_ROOT = "/home/burak/Desktop/dataset_root"  # CHANGE THIS
 DOC_ROOT = os.path.join(DATASET_ROOT, "doc")
 
 OUTPUT_ROOT = os.path.join(DATASET_ROOT, "doc_extraction_results")
@@ -21,10 +19,6 @@ os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
 
 def make_json_safe(obj):
-    """
-    Recursively convert bytes/bytearray values inside dicts/lists
-    into strings so that the whole object becomes JSON serializable.
-    """
     if isinstance(obj, dict):
         return {k: make_json_safe(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -41,23 +35,15 @@ def make_json_safe(obj):
 # ---------- FILE FORMAT DETECTION ----------
 
 def detect_file_format(file_path: str) -> str:
-    """
-    Roughly detect if the file is:
-      - classic OLE2 DOC  -> 'ole_doc'
-      - RTF               -> 'rtf'
-      - anything else     -> 'other'
-    """
     try:
         with open(file_path, "rb") as f:
             header = f.read(16)
     except Exception:
         return "other"
 
-    # RTF header: "{\rtf"
     if header.startswith(b"{\\rtf"):
         return "rtf"
 
-    # OLE2 magic: D0 CF 11 E0 A1 B1 1A E1
     if header.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
         return "ole_doc"
 
@@ -67,9 +53,6 @@ def detect_file_format(file_path: str) -> str:
 # ---------- BASIC FILE INFO ----------
 
 def get_file_basic_info(file_path: str) -> dict:
-    """
-    Basic filesystem-level information about the document.
-    """
     st = os.stat(file_path)
     filename = os.path.basename(file_path)
     name, ext = os.path.splitext(filename)
@@ -83,9 +66,6 @@ def get_file_basic_info(file_path: str) -> dict:
 
 
 def get_label_from_path(file_path: str) -> str:
-    """
-    Infer label (malicious/benign) from the folder name in the path.
-    """
     lower = file_path.lower()
     if os.sep + "malicious" + os.sep in lower:
         return "malicious"
@@ -97,10 +77,6 @@ def get_label_from_path(file_path: str) -> str:
 # ---------- OLE METADATA ----------
 
 def extract_ole_metadata(file_path: str) -> dict:
-    """
-    Extract OLE metadata from a DOC file:
-    author, title, subject, revision, dates, etc.
-    """
     meta_dict = {}
     try:
         ole = OleFileIO(file_path)
@@ -139,7 +115,17 @@ def extract_ole_metadata(file_path: str) -> dict:
     return meta_dict
 
 
-# ---------- VBA / MACRO ANALYSIS (OLE DOC) ----------
+# ---------- VBA ANALYSIS HELPERS ----------
+
+SCRIPT_KEYWORDS = [
+    "python", "python.exe",
+    "powershell", "powershell.exe",
+    "cmd.exe", "cmd /c",
+    "wscript", "cscript",
+    "bash", "sh ",
+    "rundll32", "regsvr32",
+    "mshta",
+]
 
 def _empty_vba_summary() -> dict:
     return {
@@ -154,6 +140,8 @@ def _empty_vba_summary() -> dict:
         "url_count": 0,
         "ip_like_count": 0,
         "shell_indicator_total_hits": 0,
+        "script_keyword_total_hits": 0,
+        "obfuscated_item_count": 0,
     }
 
 
@@ -166,21 +154,19 @@ def _empty_vba_strings() -> dict:
         "autoexec_keywords_list": [],
         "string_literals": [],
         "shell_indicator_hits": {},
+        "script_keyword_hits": {},
         "macro_module_names": [],
+        "vba_obfuscation_items": [],
     }
 
 
-def _analyze_vba_code(full_code: str, module_names: list[str]) -> tuple[dict, dict]:
-    """
-    Shared logic to compute all our VBA-based features
-    from a big concatenated VBA string.
-    """
+def _analyze_vba_code(full_code: str, module_names):
     summary = _empty_vba_summary()
     strings_part = _empty_vba_strings()
     strings_part["all_vba_code"] = full_code
     strings_part["macro_module_names"] = module_names
 
-    # Keyword scanning
+    # 1) Suspicious / AutoExec via VBA_Scanner
     scanner = VBA_Scanner(full_code)
     suspicious_keywords = []
     autoexec_keywords = []
@@ -196,7 +182,7 @@ def _analyze_vba_code(full_code: str, module_names: list[str]) -> tuple[dict, di
     strings_part["suspicious_keywords_list"] = suspicious_keywords
     strings_part["autoexec_keywords_list"] = autoexec_keywords
 
-    # Code size / obfuscation structure
+    # 2) Size / obfuscation structure
     code_len = len(full_code)
     summary["vba_length_chars"] = code_len
     summary["vba_line_count"] = full_code.count("\n") + 1 if code_len > 0 else 0
@@ -209,7 +195,7 @@ def _analyze_vba_code(full_code: str, module_names: list[str]) -> tuple[dict, di
         non_printable_count / code_len if code_len else 0.0
     )
 
-    # URLs & IP-like patterns
+    # 3) URLs & IP-like patterns
     urls = re.findall(r"https?://[^\s\"']+", full_code, flags=re.IGNORECASE)
     strings_part["urls"] = urls
     summary["url_count"] = len(urls)
@@ -220,11 +206,11 @@ def _analyze_vba_code(full_code: str, module_names: list[str]) -> tuple[dict, di
     strings_part["ip_like_list"] = ip_like
     summary["ip_like_count"] = len(ip_like)
 
-    # String literals (including obfuscated-looking strings)
+    # 4) String literals
     string_literals = re.findall(r'"([^"\r\n]{3,})"', full_code)
     strings_part["string_literals"] = string_literals
 
-    # Shell / download / execution indicators
+    # 5) Shell indicators
     shell_indicators = [
         "Shell",
         "WScript.Shell",
@@ -242,13 +228,24 @@ def _analyze_vba_code(full_code: str, module_names: list[str]) -> tuple[dict, di
     strings_part["shell_indicator_hits"] = hits
     summary["shell_indicator_total_hits"] = sum(hits.values())
 
+    # 6) Script keywords (python, powershell, cmd, etc.) with lines
+    script_hits = {kw: [] for kw in SCRIPT_KEYWORDS}
+    for line in full_code.splitlines():
+        lower_line = line.lower()
+        for kw in SCRIPT_KEYWORDS:
+            if kw in lower_line:
+                script_hits[kw].append(line.strip())
+
+    script_hits = {k: v for k, v in script_hits.items() if v}
+    strings_part["script_keyword_hits"] = script_hits
+    summary["script_keyword_total_hits"] = sum(len(v) for v in script_hits.values())
+
     return summary, strings_part
 
 
-def extract_vba_from_doc(file_path: str) -> tuple[dict, dict]:
-    """
-    Extract macro/VBA analysis from a classic OLE DOC file.
-    """
+# ---------- VBA FROM DOC / OLE ----------
+
+def extract_vba_from_doc(file_path: str):
     base_summary = _empty_vba_summary()
     base_strings = _empty_vba_strings()
 
@@ -260,7 +257,6 @@ def extract_vba_from_doc(file_path: str) -> tuple[dict, dict]:
 
     try:
         if not vba.detect_vba_macros():
-            # No macros detected in this DOC
             return base_summary, base_strings
 
         base_summary["has_macros"] = True
@@ -268,7 +264,6 @@ def extract_vba_from_doc(file_path: str) -> tuple[dict, dict]:
         all_code_chunks = []
         module_names = []
 
-        # Collect all macro streams
         for (subfilename, stream_path, vba_filename, vba_code) in vba.extract_macros():
             if vba_code:
                 all_code_chunks.append(vba_code)
@@ -278,7 +273,28 @@ def extract_vba_from_doc(file_path: str) -> tuple[dict, dict]:
         full_code = "\n\n".join(all_code_chunks)
         summary, strings_part = _analyze_vba_code(full_code, module_names)
 
-        # Preserve macro_count and has_macros from this context
+        # 7) Obfuscation / encoded strings via analyze_macros()
+        obf_items = []
+        obf_count = 0
+        try:
+            for kw_type, keyword, description in vba.analyze_macros():
+                item = {
+                    "type": kw_type,
+                    "keyword": keyword,
+                    "description": description,
+                }
+                obf_items.append(item)
+                t = (kw_type or "").lower()
+                if any(x in t for x in ["hex string", "base64", "dridex", "obfus"]):
+                    obf_count += 1
+        except Exception as e:
+            obf_items.append(
+                {"type": "error", "keyword": "", "description": f"analyze_macros_error: {e}"}
+            )
+
+        strings_part["vba_obfuscation_items"] = obf_items
+        summary["obfuscated_item_count"] = obf_count
+
         summary["has_macros"] = True
         summary["macro_count"] = base_summary["macro_count"]
 
@@ -294,11 +310,7 @@ def extract_vba_from_doc(file_path: str) -> tuple[dict, dict]:
             pass
 
 
-def extract_vba_from_ole_bytes(data: bytes, source_name: str) -> tuple[dict, dict]:
-    """
-    Same analysis as extract_vba_from_doc, but for an OLE object
-    provided as raw bytes (for example, from an RTF embedded object).
-    """
+def extract_vba_from_ole_bytes(data: bytes, source_name: str):
     base_summary = _empty_vba_summary()
     base_strings = _empty_vba_strings()
 
@@ -326,10 +338,31 @@ def extract_vba_from_ole_bytes(data: bytes, source_name: str) -> tuple[dict, dic
         full_code = "\n\n".join(all_code_chunks)
         summary, strings_part = _analyze_vba_code(full_code, module_names)
 
+        obf_items = []
+        obf_count = 0
+        try:
+            for kw_type, keyword, description in vba.analyze_macros():
+                item = {
+                    "type": kw_type,
+                    "keyword": keyword,
+                    "description": description,
+                }
+                obf_items.append(item)
+                t = (kw_type or "").lower()
+                if any(x in t for x in ["hex string", "base64", "dridex", "obfus"]):
+                    obf_count += 1
+        except Exception as e:
+            obf_items.append(
+                {"type": "error", "keyword": "", "description": f"analyze_macros_error: {e}"}
+            )
+
+        strings_part["vba_obfuscation_items"] = obf_items
+        summary["obfuscated_item_count"] = obf_count
+
         summary["has_macros"] = True
         summary["macro_count"] = base_summary["macro_count"]
 
-        return summary, strings_part
+        return summary, base_strings if not strings_part else (summary, strings_part)
 
     except Exception as e:
         base_summary["error"] = f"VBA_analysis_error: {e}"
@@ -341,18 +374,10 @@ def extract_vba_from_ole_bytes(data: bytes, source_name: str) -> tuple[dict, dic
             pass
 
 
-# ---------- RTF ANALYSIS (EMBEDDED OBJECTS) ----------
+# ---------- RTF ANALYSIS ----------
 
 def extract_rtf_features(file_path: str) -> dict:
-    """
-    Use oletools.rtfobj to extract embedded objects from an RTF file.
-    For each object, we collect:
-      - size and index
-      - whether it looks like OLE2, PE executable, ZIP, etc.
-      - URLs / IP-like patterns in the decoded data
-      - (if OLE2) nested VBA macro analysis via VBA_Parser(data=...)
-    """
-    info: dict = {
+    info = {
         "rtf_object_count": 0,
         "embedded_ole_object_count": 0,
         "embedded_ole_with_macros_count": 0,
@@ -370,10 +395,7 @@ def extract_rtf_features(file_path: str) -> dict:
                 "decoded_size": len(data),
             }
 
-            # Magic checks
-            is_ole = data.startswith(
-                b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
-            )
+            is_ole = data.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
             is_pe = data.startswith(b"MZ")
             is_zip = data.startswith(b"PK\x03\x04")
 
@@ -383,22 +405,17 @@ def extract_rtf_features(file_path: str) -> dict:
 
             if is_ole:
                 info["embedded_ole_object_count"] += 1
-
             if is_pe:
                 info["embedded_pe_like_count"] += 1
-
             if is_zip:
                 info["embedded_zip_like_count"] += 1
 
-            # Extract text for URL/IP scanning
             try:
                 text_sample = data.decode("latin-1", errors="ignore")
             except Exception:
                 text_sample = ""
 
-            urls = re.findall(
-                r"https?://[^\s\"']+", text_sample, flags=re.IGNORECASE
-            )
+            urls = re.findall(r"https?://[^\s\"']+", text_sample, flags=re.IGNORECASE)
             if urls:
                 obj_entry["urls"] = urls
 
@@ -408,14 +425,12 @@ def extract_rtf_features(file_path: str) -> dict:
             if ip_like:
                 obj_entry["ip_like_list"] = ip_like
 
-            # If it looks like an OLE object, run VBA analysis on it
             if is_ole:
                 vba_summary, vba_strings = extract_vba_from_ole_bytes(
                     data, source_name=f"rtf_object_{index}"
                 )
                 obj_entry["vba_summary"] = vba_summary
                 obj_entry["vba_strings"] = vba_strings
-
                 if vba_summary.get("has_macros"):
                     info["embedded_ole_with_macros_count"] += 1
 
@@ -427,18 +442,9 @@ def extract_rtf_features(file_path: str) -> dict:
     return info
 
 
-# ---------- PROCESS SINGLE DOC/RTF ----------
+# ---------- PROCESS SINGLE FILE ----------
 
 def process_single_doc(file_path: str) -> dict:
-    """
-    Run the full pipeline for a single file stored under doc/:
-    - detect real format (classic OLE DOC vs RTF)
-    - basic file info
-    - OLE metadata (for OLE DOC)
-    - macro/VBA analysis (for OLE DOC)
-    - RTF embedded objects + nested VBA (for RTF)
-    - pack everything into a structured JSON and write to disk
-    """
     label = get_label_from_path(file_path)
     file_info = get_file_basic_info(file_path)
     file_format = detect_file_format(file_path)
@@ -450,7 +456,6 @@ def process_single_doc(file_path: str) -> dict:
     rtf_features = {}
 
     if file_format == "ole_doc":
-        # Classic Word 97-2003 DOC
         ole_meta = extract_ole_metadata(file_path)
         vba_summary, vba_strings = extract_vba_from_doc(file_path)
         if isinstance(ole_meta, dict) and "error" in ole_meta:
@@ -459,7 +464,6 @@ def process_single_doc(file_path: str) -> dict:
             errors.append(vba_summary["error"])
 
     elif file_format == "rtf":
-        # RTF: no classic OLE metadata, but we analyse embedded objects
         ole_meta = {
             "note": "RTF file – classic OLE metadata is not applicable."
         }
@@ -468,7 +472,6 @@ def process_single_doc(file_path: str) -> dict:
             errors.append(rtf_features["error"])
 
     else:
-        # Unknown/other: try OLE anyway (might still be a valid OLE compound)
         ole_meta = extract_ole_metadata(file_path)
         vba_summary, vba_strings = extract_vba_from_doc(file_path)
         if isinstance(ole_meta, dict) and "error" in ole_meta:
@@ -487,7 +490,6 @@ def process_single_doc(file_path: str) -> dict:
         "errors": errors,
     }
 
-    # Write per-file JSON
     safe_record = make_json_safe(record)
     base_name = os.path.basename(file_path)
     json_name = base_name + ".json"
@@ -500,15 +502,9 @@ def process_single_doc(file_path: str) -> dict:
     return safe_record
 
 
-# ---------- MAIN: SCAN ENTIRE DOC DATASET ----------
+# ---------- MAIN ----------
 
 def iter_doc_files():
-    """
-    Yield .doc and .rtf files (exclude .docx) from:
-        doc/malicious
-        doc/benign
-    under the dataset root.
-    """
     for label_dir in ["malicious", "benign"]:
         base_dir = os.path.join(DOC_ROOT, label_dir)
         if not os.path.isdir(base_dir):
@@ -519,7 +515,7 @@ def iter_doc_files():
             for fname in files:
                 name_lower = fname.lower()
                 if name_lower.endswith(".docx"):
-                    continue  # handled by separate DOCX extractor
+                    continue
                 if name_lower.endswith(".doc") or name_lower.endswith(".rtf"):
                     yield os.path.join(root, fname)
 
